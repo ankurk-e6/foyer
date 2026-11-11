@@ -933,6 +933,113 @@ mod tests {
             .unwrap()
     }
 
+    async fn burst_store(
+        dir: impl AsRef<Path>,
+        reinsertion_filter: StorageFilter,
+    ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {
+        let device = FsDeviceBuilder::new(dir)
+            .with_capacity(ByteSize::mib(64).as_u64() as _)
+            .build()
+            .unwrap();
+        let spawner = Spawner::current();
+        let io_engine = io_engine_for_test(spawner.clone()).await;
+        let metrics = Arc::new(Metrics::noop());
+        let builder = BlockEngineConfig {
+            device,
+            block_size: 256 * 1024,
+            compression: Compression::None,
+            indexer_shards: 4,
+            recover_concurrency: 2,
+            flushers: 1,
+            reclaimers: 1,
+            clean_block_threshold: 1,
+            admission_filter: StorageFilter::new(),
+            eviction_pickers: vec![Box::<FifoPicker>::default()],
+            reinsertion_filter,
+            enable_tombstone_log: false,
+            buffer_pool_size: 64 * 1024,
+            blob_index_size: 4 * 1024,
+            submit_queue_size_threshold: 16 * 1024 * 1024 * 2,
+            flush_switch: Switch::default(),
+            load_holder: Holder::default(),
+            marker: PhantomData,
+        };
+
+        let builder = Box::new(builder);
+        builder
+            .build(EngineBuildContext {
+                io_engine,
+                metrics,
+                spawner,
+                recover_mode: RecoverMode::Strict,
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_burst_buffer_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+        let store = burst_store(dir.path(), StorageFilter::new().with_condition(RejectAll)).await;
+        let start = std::time::Instant::now();
+        let entries: u64 = std::env::var("BURST_ENTRIES")
+            .unwrap_or_else(|_| "256".into())
+            .parse()
+            .unwrap();
+        for key in 0..entries {
+            enqueue(&store, memory.insert(key, vec![key as u8; 8192]));
+        }
+        let queued_peak = store.inner.submit_queue_size.load(Ordering::Relaxed);
+        assert!(queued_peak <= 32 * 1024 * 1024);
+        store.wait().await;
+        assert_eq!(store.inner.submit_queue_size.load(Ordering::Relaxed), 0);
+        let write_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let mut found = 0u64;
+        for key in 0..entries {
+            if let Some((actual_key, value)) = store.load(memory.hash(&key)).await.unwrap().kv() {
+                assert_eq!(actual_key, key);
+                assert_eq!(value, vec![key as u8; 8192]);
+                found += 1;
+            }
+        }
+        println!(
+            "BURST submitted={entries} retained={found} dropped={} payload_bytes={} write_ms={write_ms:.3}",
+            entries - found,
+            entries * 8192
+        );
+        if std::env::var_os("REQUIRE_ALL_RETAINED").is_some() {
+            assert_eq!(found, entries);
+        }
+        store.close().await.unwrap();
+        let recovered = burst_store(dir.path(), StorageFilter::new().with_condition(RejectAll)).await;
+        for key in 0..entries {
+            assert_eq!(
+                recovered.load(memory.hash(&key)).await.unwrap().kv(),
+                Some((key, vec![key as u8; 8192]))
+            );
+        }
+        recovered.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_burst_oversize_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = cache_for_test();
+        let store = burst_store(dir.path(), StorageFilter::new().with_condition(RejectAll)).await;
+        enqueue(&store, memory.insert(1, vec![1; 8192]));
+        enqueue(&store, memory.insert(2, vec![2; 128 * 1024]));
+        enqueue(&store, memory.insert(3, vec![3; 8192]));
+        store.wait().await;
+        assert!(store.load(memory.hash(&2)).await.unwrap().kv().is_none());
+        for key in [1, 3] {
+            assert_eq!(
+                store.load(memory.hash(&key)).await.unwrap().kv(),
+                Some((key, vec![key as u8; 8192]))
+            );
+        }
+        store.close().await.unwrap();
+    }
     async fn store_for_test_with_tombstone_log(
         dir: impl AsRef<Path>,
     ) -> Arc<BlockEngine<u64, Vec<u8>, TestProperties>> {

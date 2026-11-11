@@ -347,9 +347,14 @@ where
     pub async fn run(mut self) -> Result<()> {
         let mut rx = self.rx.take().unwrap();
 
+        let mut pending = None;
         loop {
-            while let Ok(submission) = rx.try_recv() {
-                self.recv(submission);
+            if let Some(submission) = pending.take() {
+                pending = self.recv(submission);
+            }
+            while pending.is_none() {
+                let Ok(submission) = rx.try_recv() else { break };
+                pending = self.recv(submission);
             }
 
             #[cfg(not(any(test, feature = "test_utils")))]
@@ -396,8 +401,8 @@ where
                     // `try_into_io_buffer` must return `Some(..)` here.
                     self.rotate_buffer = io_slice.try_into_io_slice_mut();
                 }
-                Ok(submission) = rx.recv() => {
-                    self.recv(submission);
+                Ok(submission) = rx.recv(), if pending.is_none() => {
+                    pending = self.recv(submission);
                 }
                 // Graceful shutdown.
                 else => break,
@@ -406,7 +411,7 @@ where
         Ok(())
     }
 
-    fn recv(&mut self, submission: Submission<K, V, P>) {
+    fn recv(&mut self, submission: Submission<K, V, P>) -> Option<Submission<K, V, P>> {
         tracing::trace!(
             id = self.id,
             ?submission,
@@ -436,6 +441,16 @@ where
                     self.compression,
                     sequence,
                 );
+                // Keep one entry pending while a nonempty buffer is flushed.
+                // It remains charged to the existing bounded submit queue.
+                // A failure on an empty buffer is not retried indefinitely.
+                if !enqueued && !self.buffer.as_ref().unwrap().is_empty() {
+                    return Some(Submission::CacheEntry {
+                        piece,
+                        estimated_size,
+                        sequence,
+                    });
+                }
                 if enqueued {
                     self.piece_refs.push(piece);
                 }
@@ -456,6 +471,7 @@ where
             }
             Submission::Wait { tx } => self.waiters.push(tx),
         }
+        None
     }
 
     fn submit_io_task(
